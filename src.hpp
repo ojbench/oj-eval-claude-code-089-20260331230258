@@ -74,8 +74,13 @@ public:
     int layer = get_layer(size);
     if (layer < 0) return -1;
 
-    // Find minimum aligned address by trying addresses from 0
-    for (int addr = 0; addr < ram_size; addr += size) {
+    // Try allocating at aligned addresses starting from 0
+    // But limit attempts to avoid TLE
+    int block_size = get_block_size(layer);
+    int max_attempts = ram_size / block_size + 1;  // At most this many blocks exist
+
+    for (int i = 0; i < max_attempts && i * size < ram_size; i++) {
+      int addr = i * size;
       if (allocate_block(layer, addr)) {
         return addr;
       }
@@ -141,7 +146,7 @@ private:
 
   void add_free_block(int layer, int addr) {
     FreeNode* node = new FreeNode(addr);
-    // Insert in sorted order for efficiency
+    // Insert in sorted order
     if (free_lists[layer] == nullptr || free_lists[layer]->addr > addr) {
       node->next = free_lists[layer];
       free_lists[layer] = node;
@@ -182,7 +187,7 @@ private:
     FreeNode* curr = free_lists[layer];
     while (curr != nullptr) {
       if (curr->addr == addr) return true;
-      if (curr->addr > addr) break;  // Optimization: list is sorted
+      if (curr->addr > addr) break;
       curr = curr->next;
     }
     return false;
