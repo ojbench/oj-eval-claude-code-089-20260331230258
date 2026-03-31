@@ -2,14 +2,6 @@
 
 namespace sjtu {
 
-// Simple linked list node for free blocks (no STL allowed)
-struct FreeNode {
-  int addr;
-  FreeNode* next;
-
-  FreeNode(int a) : addr(a), next(nullptr) {}
-};
-
 class BuddyAllocator {
 public:
   /**
@@ -32,34 +24,32 @@ public:
       size *= 2;
     }
 
-    // Allocate free lists for each layer
-    free_lists = new FreeNode*[num_layers];
+    // Allocate free bit arrays for each layer
+    free_blocks = new bool*[num_layers];
+    num_blocks_per_layer = new int[num_layers];
+
     for (int i = 0; i < num_layers; i++) {
-      free_lists[i] = nullptr;
+      int block_size = get_block_size(i);
+      num_blocks_per_layer[i] = ram_size / block_size;
+      free_blocks[i] = new bool[num_blocks_per_layer[i]];
+      for (int j = 0; j < num_blocks_per_layer[i]; j++) {
+        free_blocks[i][j] = false;
+      }
     }
 
     // Initialize top layer with all available blocks
     int top_layer = num_layers - 1;
-    int block_size = get_block_size(top_layer);
-    int num_blocks = ram_size / block_size;
-
-    for (int i = 0; i < num_blocks; i++) {
-      int addr = i * block_size;
-      add_free_block(top_layer, addr);
+    for (int i = 0; i < num_blocks_per_layer[top_layer]; i++) {
+      free_blocks[top_layer][i] = true;
     }
   }
 
   ~BuddyAllocator() {
-    // Clean up all free lists
     for (int i = 0; i < num_layers; i++) {
-      FreeNode* curr = free_lists[i];
-      while (curr != nullptr) {
-        FreeNode* next = curr->next;
-        delete curr;
-        curr = next;
-      }
+      delete[] free_blocks[i];
     }
-    delete[] free_lists;
+    delete[] free_blocks;
+    delete[] num_blocks_per_layer;
   }
 
   /**
@@ -74,13 +64,8 @@ public:
     int layer = get_layer(size);
     if (layer < 0) return -1;
 
-    // Try allocating at aligned addresses starting from 0
-    // But limit attempts to avoid TLE
-    int block_size = get_block_size(layer);
-    int max_attempts = ram_size / block_size + 1;  // At most this many blocks exist
-
-    for (int i = 0; i < max_attempts && i * size < ram_size; i++) {
-      int addr = i * size;
+    // Find minimum aligned address
+    for (int addr = 0; addr < ram_size; addr += size) {
       if (allocate_block(layer, addr)) {
         return addr;
       }
@@ -118,7 +103,8 @@ public:
     int layer = get_layer(size);
     if (layer < 0) return;
 
-    add_free_block(layer, addr);
+    int index = addr_to_index(layer, addr);
+    free_blocks[layer][index] = true;
 
     // Try to merge with buddy
     merge_buddies(layer, addr);
@@ -128,7 +114,8 @@ private:
   int ram_size;
   int min_block_size;
   int num_layers;
-  FreeNode** free_lists;
+  bool** free_blocks;
+  int* num_blocks_per_layer;
 
   int get_layer(int size) {
     int layer = 0;
@@ -144,58 +131,25 @@ private:
     return min_block_size << layer;
   }
 
-  void add_free_block(int layer, int addr) {
-    FreeNode* node = new FreeNode(addr);
-    // Insert in sorted order
-    if (free_lists[layer] == nullptr || free_lists[layer]->addr > addr) {
-      node->next = free_lists[layer];
-      free_lists[layer] = node;
-    } else {
-      FreeNode* curr = free_lists[layer];
-      while (curr->next != nullptr && curr->next->addr < addr) {
-        curr = curr->next;
-      }
-      node->next = curr->next;
-      curr->next = node;
-    }
+  int addr_to_index(int layer, int addr) {
+    return addr / get_block_size(layer);
   }
 
-  bool remove_free_block(int layer, int addr) {
-    if (free_lists[layer] == nullptr) return false;
-
-    if (free_lists[layer]->addr == addr) {
-      FreeNode* node = free_lists[layer];
-      free_lists[layer] = node->next;
-      delete node;
-      return true;
-    }
-
-    FreeNode* curr = free_lists[layer];
-    while (curr->next != nullptr) {
-      if (curr->next->addr == addr) {
-        FreeNode* node = curr->next;
-        curr->next = node->next;
-        delete node;
-        return true;
-      }
-      curr = curr->next;
-    }
-    return false;
+  int index_to_addr(int layer, int index) {
+    return index * get_block_size(layer);
   }
 
-  bool has_free_block(int layer, int addr) {
-    FreeNode* curr = free_lists[layer];
-    while (curr != nullptr) {
-      if (curr->addr == addr) return true;
-      if (curr->addr > addr) break;
-      curr = curr->next;
-    }
-    return false;
-  }
-
-  int get_buddy_addr(int layer, int addr) {
+  bool is_free(int layer, int addr) {
     int block_size = get_block_size(layer);
-    return addr ^ block_size;
+    if (addr % block_size != 0) return false;
+    if (addr >= ram_size) return false;
+    int index = addr_to_index(layer, addr);
+    if (index >= num_blocks_per_layer[layer]) return false;
+    return free_blocks[layer][index];
+  }
+
+  int get_buddy_index(int layer, int index) {
+    return index ^ 1;
   }
 
   // Try to allocate a block at the given layer and address
@@ -207,9 +161,12 @@ private:
     if (addr % block_size != 0) return false;
     if (addr >= ram_size) return false;
 
+    int index = addr_to_index(layer, addr);
+    if (index >= num_blocks_per_layer[layer]) return false;
+
     // If block is already free at this layer, use it
-    if (has_free_block(layer, addr)) {
-      remove_free_block(layer, addr);
+    if (free_blocks[layer][index]) {
+      free_blocks[layer][index] = false;
       return true;
     }
 
@@ -226,12 +183,16 @@ private:
     }
 
     // Parent was allocated, split it
-    add_free_block(layer, parent_addr);
-    add_free_block(layer, parent_addr + block_size);
+    int parent_index = addr_to_index(parent_layer, parent_addr);
+    int child_index1 = parent_index * 2;
+    int child_index2 = child_index1 + 1;
 
-    // Now allocate from the newly split blocks
-    if (has_free_block(layer, addr)) {
-      remove_free_block(layer, addr);
+    free_blocks[layer][child_index1] = true;
+    free_blocks[layer][child_index2] = true;
+
+    // Now allocate the requested block
+    if (free_blocks[layer][index]) {
+      free_blocks[layer][index] = false;
       return true;
     }
 
@@ -241,18 +202,22 @@ private:
   void merge_buddies(int layer, int addr) {
     if (layer >= num_layers - 1) return;
 
-    int buddy_addr = get_buddy_addr(layer, addr);
+    int index = addr_to_index(layer, addr);
+    int buddy_index = get_buddy_index(layer, index);
+
+    if (buddy_index >= num_blocks_per_layer[layer]) return;
 
     // Check if buddy is free
-    if (has_free_block(layer, buddy_addr)) {
+    if (free_blocks[layer][buddy_index]) {
       // Merge with buddy
-      remove_free_block(layer, addr);
-      remove_free_block(layer, buddy_addr);
+      free_blocks[layer][index] = false;
+      free_blocks[layer][buddy_index] = false;
 
-      int parent_addr = (addr < buddy_addr) ? addr : buddy_addr;
+      int parent_index = index / 2;
       int parent_layer = layer + 1;
+      int parent_addr = index_to_addr(parent_layer, parent_index);
 
-      add_free_block(parent_layer, parent_addr);
+      free_blocks[parent_layer][parent_index] = true;
 
       // Recursively try to merge parent
       merge_buddies(parent_layer, parent_addr);
