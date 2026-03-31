@@ -38,16 +38,6 @@ public:
       free_lists[i] = nullptr;
     }
 
-    // Allocate allocated tracking arrays
-    allocated = new bool*[num_layers];
-    for (int i = 0; i < num_layers; i++) {
-      int num_blocks = ram_size / get_block_size(i);
-      allocated[i] = new bool[num_blocks];
-      for (int j = 0; j < num_blocks; j++) {
-        allocated[i][j] = false;
-      }
-    }
-
     // Initialize top layer with all available blocks
     int top_layer = num_layers - 1;
     int block_size = get_block_size(top_layer);
@@ -68,10 +58,8 @@ public:
         delete curr;
         curr = next;
       }
-      delete[] allocated[i];
     }
     delete[] free_lists;
-    delete[] allocated;
   }
 
   /**
@@ -86,34 +74,11 @@ public:
     int layer = get_layer(size);
     if (layer < 0) return -1;
 
-    int min_addr = -1;
-
-    // Find minimum available address aligned to size
-    // First check existing free blocks
-    FreeNode* curr = free_lists[layer];
-    while (curr != nullptr) {
-      if (curr->addr % size == 0) {
-        if (min_addr == -1 || curr->addr < min_addr) {
-          min_addr = curr->addr;
-        }
+    // Find minimum aligned address by trying addresses from 0
+    for (int addr = 0; addr < ram_size; addr += size) {
+      if (allocate_block(layer, addr)) {
+        return addr;
       }
-      curr = curr->next;
-    }
-
-    // Also check if we can create blocks at lower addresses by splitting
-    for (int addr = 0; addr < ram_size && (min_addr == -1 || addr < min_addr); addr += size) {
-      if (ensure_block_exists(layer, addr)) {
-        if (has_free_block(layer, addr)) {
-          min_addr = addr;
-          break;  // Found minimum, no need to check further
-        }
-      }
-    }
-
-    if (min_addr != -1) {
-      remove_free_block(layer, min_addr);
-      mark_allocated(layer, min_addr, true);
-      return min_addr;
     }
 
     return -1;
@@ -131,18 +96,10 @@ public:
     int layer = get_layer(size);
     if (layer < 0) return -1;
 
-    // Ensure the block exists and is available
-    if (!ensure_block_exists(layer, addr)) {
-      return -1;
+    if (allocate_block(layer, addr)) {
+      return addr;
     }
-
-    if (!has_free_block(layer, addr)) {
-      return -1;
-    }
-
-    remove_free_block(layer, addr);
-    mark_allocated(layer, addr, true);
-    return addr;
+    return -1;
   }
 
   /**
@@ -156,11 +113,10 @@ public:
     int layer = get_layer(size);
     if (layer < 0) return;
 
-    mark_allocated(layer, addr, false);
     add_free_block(layer, addr);
 
     // Try to merge with buddy
-    merge_if_possible(layer, addr);
+    merge_buddies(layer, addr);
   }
 
 private:
@@ -168,7 +124,6 @@ private:
   int min_block_size;
   int num_layers;
   FreeNode** free_lists;
-  bool** allocated;  // Track which blocks are allocated at each layer
 
   int get_layer(int size) {
     int layer = 0;
@@ -184,23 +139,9 @@ private:
     return min_block_size << layer;
   }
 
-  int addr_to_index(int layer, int addr) {
-    return addr / get_block_size(layer);
-  }
-
-  void mark_allocated(int layer, int addr, bool alloc) {
-    int index = addr_to_index(layer, addr);
-    allocated[layer][index] = alloc;
-  }
-
-  bool is_allocated(int layer, int addr) {
-    int index = addr_to_index(layer, addr);
-    return allocated[layer][index];
-  }
-
   void add_free_block(int layer, int addr) {
     FreeNode* node = new FreeNode(addr);
-    // Insert in sorted order
+    // Insert in sorted order for efficiency
     if (free_lists[layer] == nullptr || free_lists[layer]->addr > addr) {
       node->next = free_lists[layer];
       free_lists[layer] = node;
@@ -241,6 +182,7 @@ private:
     FreeNode* curr = free_lists[layer];
     while (curr != nullptr) {
       if (curr->addr == addr) return true;
+      if (curr->addr > addr) break;  // Optimization: list is sorted
       curr = curr->next;
     }
     return false;
@@ -251,76 +193,54 @@ private:
     return addr ^ block_size;
   }
 
-  // Check if a range is available (no blocks allocated in this range at any layer)
-  bool is_range_available(int start_addr, int size) {
-    // Check all layers to see if any allocated block overlaps with this range
-    for (int l = 0; l < num_layers; l++) {
-      int block_size = get_block_size(l);
-      // Check blocks that could overlap
-      int start_block = start_addr / block_size;
-      int end_block = (start_addr + size - 1) / block_size;
-      for (int b = start_block; b <= end_block; b++) {
-        int block_addr = b * block_size;
-        if (is_allocated(l, block_addr)) {
-          // Check if this allocated block overlaps with our range
-          if (block_addr < start_addr + size && block_addr + block_size > start_addr) {
-            return false;
-          }
-        }
-      }
-    }
-    return true;
-  }
-
-  // Ensure a block exists at the given layer and address
-  // by splitting parent blocks if necessary
-  bool ensure_block_exists(int layer, int addr) {
-    // Check if we can even have a block at this address
+  // Try to allocate a block at the given layer and address
+  // Returns true if successful
+  bool allocate_block(int layer, int addr) {
     int block_size = get_block_size(layer);
+
+    // Check alignment
     if (addr % block_size != 0) return false;
     if (addr >= ram_size) return false;
 
-    // If block is already allocated, we can't use it
-    if (is_allocated(layer, addr)) return false;
+    // If block is already free at this layer, use it
+    if (has_free_block(layer, addr)) {
+      remove_free_block(layer, addr);
+      return true;
+    }
 
-    // Check if the range overlaps with any allocated blocks
-    if (!is_range_available(addr, block_size)) return false;
-
-    // If block is already free, it exists
-    if (has_free_block(layer, addr)) return true;
-
-    // Need to split parent
+    // Try to split a parent block
     if (layer >= num_layers - 1) return false;
 
     int parent_layer = layer + 1;
     int parent_block_size = get_block_size(parent_layer);
     int parent_addr = (addr / parent_block_size) * parent_block_size;
 
-    // Recursively ensure parent exists
-    if (!ensure_block_exists(parent_layer, parent_addr)) {
+    // Recursively try to allocate the parent
+    if (!allocate_block(parent_layer, parent_addr)) {
       return false;
     }
 
-    // Parent exists and is free, split it
-    if (!has_free_block(parent_layer, parent_addr)) {
-      return false;
-    }
-
-    remove_free_block(parent_layer, parent_addr);
+    // Parent was allocated, split it
     add_free_block(layer, parent_addr);
     add_free_block(layer, parent_addr + block_size);
 
-    return has_free_block(layer, addr);
+    // Now allocate from the newly split blocks
+    if (has_free_block(layer, addr)) {
+      remove_free_block(layer, addr);
+      return true;
+    }
+
+    return false;
   }
 
-  void merge_if_possible(int layer, int addr) {
+  void merge_buddies(int layer, int addr) {
     if (layer >= num_layers - 1) return;
 
     int buddy_addr = get_buddy_addr(layer, addr);
 
-    // Check if buddy is free and not allocated
-    if (has_free_block(layer, buddy_addr) && !is_allocated(layer, buddy_addr)) {
-      // Merge
+    // Check if buddy is free
+    if (has_free_block(layer, buddy_addr)) {
+      // Merge with buddy
       remove_free_block(layer, addr);
       remove_free_block(layer, buddy_addr);
 
@@ -330,7 +250,7 @@ private:
       add_free_block(parent_layer, parent_addr);
 
       // Recursively try to merge parent
-      merge_if_possible(parent_layer, parent_addr);
+      merge_buddies(parent_layer, parent_addr);
     }
   }
 };
