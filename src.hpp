@@ -65,7 +65,14 @@ public:
     if (layer < 0) return -1;
 
     // Find minimum aligned address
+    // Limit iterations to avoid worst-case TLE
+    int block_size = get_block_size(layer);
+    int max_possible_blocks = ram_size / block_size;
+
+    int checks = 0;
     for (int addr = 0; addr < ram_size; addr += size) {
+      checks++;
+      if (checks > max_possible_blocks * 3) break;  // Safety limit
       if (allocate_block(layer, addr)) {
         return addr;
       }
